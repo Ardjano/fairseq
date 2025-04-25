@@ -66,7 +66,7 @@ class DecodingConfig(DecoderConfig, FlashlightDecoderConfig):
 class InferConfig(FairseqDataclass):
     task: Any = None
     decoding: DecodingConfig = DecodingConfig()
-    common: CommonConfig = CommonConfig()
+    common: CommonConfig = field(default_factory=CommonConfig)
     common_eval: CommonEvalConfig = CommonEvalConfig()
     checkpoint: CheckpointConfig = CheckpointConfig()
     distributed_training: DistributedTrainingConfig = DistributedTrainingConfig()
@@ -108,7 +108,7 @@ class InferenceProcessor:
         if "adapter" in ckpt_obj:
             target_lang = self.cfg.dataset.gen_subset.split(":")[0]
             assert target_lang in ckpt_obj["adapter"]
-            
+
             logger.info(f">>> LOADING ADAPTER: {target_lang}")
             ft_obj = ckpt_obj["adapter"][target_lang]
             ft_model = ft_obj["model"]
