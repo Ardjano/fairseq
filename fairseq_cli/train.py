@@ -356,6 +356,11 @@ def train(
 
     # reset epoch-level meters
     metrics.reset_meters("train")
+
+    # for knn-LM
+    if hasattr(trainer.model, "after_train_hook"):
+        trainer.model.after_train_hook()
+
     return valid_losses, should_stop
 
 

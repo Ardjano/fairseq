@@ -126,26 +126,37 @@ def save_checkpoint(cfg: CheckpointConfig, trainer, epoch_itr, val_loss):
     ]
     saved_cp = None
     if len(checkpoints) > 0 and trainer.should_save_checkpoint_on_current_rank:
-        saved_cp = trainer.save_checkpoint(checkpoints[0], extra_state)
-        for cp in checkpoints[1:]:
-            if cfg.write_checkpoints_asynchronously:
-                # TODO[ioPath]: Need to implement a delayed asynchronous
-                # file copying/moving feature.
-                logger.warning(
-                    f"ioPath is not copying {checkpoints[0]} to {cp} "
-                    "since async write mode is on."
-                )
-            else:
-                assert PathManager.copy(
-                    checkpoints[0], cp, overwrite=True
-                ), f"Failed to copy {checkpoints[0]} to {cp}"
+       ## knn-box related code start >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        ## if we are training combiner, we only dump the combiner to disk
+        if hasattr(cfg, "knn_mode") and \
+                (cfg.knn_mode == "train_kster" or cfg.knn_mode == "train_metak"):
+            # if we got a new best checkpoint, save the combiner
+            if checkpoint_conds["checkpoint_best{}.pt".format(suffix)]:
+                assert hasattr(cfg, "knn_combiner_path"), "you must provide knn_combiner_path"
+                trainer.model.decoder.combiner.dump(cfg.knn_combiner_path)
+                logger.info("dumped combiner to {}".format(cfg.knn_combiner_path))
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< end
+        else:
+            saved_cp = trainer.save_checkpoint(checkpoints[0], extra_state)
+            for cp in checkpoints[1:]:
+                if cfg.write_checkpoints_asynchronously:
+                    # TODO[ioPath]: Need to implement a delayed asynchronous
+                    # file copying/moving feature.
+                    logger.warning(
+                        f"ioPath is not copying {checkpoints[0]} to {cp} "
+                        "since async write mode is on."
+                    )
+                else:
+                    assert PathManager.copy(
+                        checkpoints[0], cp, overwrite=True
+                    ), f"Failed to copy {checkpoints[0]} to {cp}"
 
-        write_timer.stop()
-        logger.info(
-            "Saved checkpoint {} (epoch {} @ {} updates, score {}) (writing took {} seconds)".format(
-                checkpoints[0], epoch, updates, val_loss, write_timer.sum
+            write_timer.stop()
+            logger.info(
+                "Saved checkpoint {} (epoch {} @ {} updates, score {}) (writing took {} seconds)".format(
+                    checkpoints[0], epoch, updates, val_loss, write_timer.sum
+                )
             )
-        )
 
     if (
         not end_of_epoch
@@ -389,6 +400,8 @@ def load_model_ensemble(
     assert not (
         strict and num_shards > 1
     ), "Cannot load state dict with strict=True and checkpoint shards > 1"
+    # add by knn-box. set strict=False
+    strict = False
     ensemble, args, _task = load_model_ensemble_and_task(
         filenames,
         arg_overrides,
@@ -432,6 +445,9 @@ def load_model_ensemble_and_task(
     assert not (
         strict and num_shards > 1
     ), "Cannot load state dict with strict=True and checkpoint shards > 1"
+    # add by knn-box. set strict=False
+    strict = False
+
     ensemble = []
     cfg = None
     for filename in filenames:
