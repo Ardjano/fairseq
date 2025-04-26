@@ -509,3 +509,6 @@ tests/gpu/desktop.ini
 tests/speech/desktop.ini
 tests/speech_recognition/desktop.ini
 tests/tasks/desktop.ini
+datastore/
+pretrain-models/
+knnbox-scripts/common/validate1.py

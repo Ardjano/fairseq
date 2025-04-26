@@ -1,29 +1,29 @@
-r"""
-This file is copied from fairseq_cli/validate.py.
-knnbox made 2 major changes:
-
-change 1. We modified the part of parsing args so that is
-can parse the arch specified on the cli instead of directly
-using the arch inside checkpoint.
-
-change 2. we add codes about `saving datastore vals`, `dump datastore`, etc.
-"""
+#!/usr/bin/env python3 -u
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
 import logging
 import os
 import sys
+from argparse import Namespace
 from itertools import chain
 
 import torch
+from omegaconf import DictConfig
+
 from fairseq import checkpoint_utils, distributed_utils, options, utils
+from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 from fairseq.logging import metrics, progress_bar
+from fairseq.utils import reset_logging
+
 
 ## knnbox related code start >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 from knnbox.datastore import Datastore, GreedyMergeDatastore, PckDatastore
 from knnbox.common_utils import filter_pad_tokens, global_vars
 import numpy as np
 ## <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< end
-
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -34,18 +34,30 @@ logging.basicConfig(
 logger = logging.getLogger("fairseq_cli.validate")
 
 
-def main(args, override_args=None):
-    utils.import_user_module(args)
+def main(cfg: DictConfig, override_args=None):
+    if isinstance(cfg, Namespace):
+        cfg = convert_namespace_to_omegaconf(cfg)
+
+    utils.import_user_module(cfg.common)
+
+    reset_logging()
 
     assert (
-        args.max_tokens is not None or args.batch_size is not None
+        cfg.dataset.max_tokens is not None or cfg.dataset.batch_size is not None
     ), "Must specify batch size either with --max-tokens or --batch-size"
 
-    use_fp16 = args.fp16
-    use_cuda = torch.cuda.is_available() and not args.cpu
+    use_fp16 = cfg.common.fp16
+    use_cuda = torch.cuda.is_available() and not cfg.common.cpu
 
     if use_cuda:
-        torch.cuda.set_device(args.device_id)
+        torch.cuda.set_device(cfg.distributed_training.device_id)
+
+    if cfg.distributed_training.distributed_world_size > 1:
+        data_parallel_world_size = distributed_utils.get_data_parallel_world_size()
+        data_parallel_rank = distributed_utils.get_data_parallel_rank()
+    else:
+        data_parallel_world_size = 1
+        data_parallel_rank = 0
 
     if override_args is not None:
         overrides = vars(override_args)
@@ -54,50 +66,53 @@ def main(args, override_args=None):
         overrides = None
 
     # Load ensemble
-    logger.info("loading model(s) from {}".format(args.path))
-    models, model_args, task = checkpoint_utils.load_model_ensemble_and_task(
-        [args.path],
+    logger.info("loading model(s) from {}".format(cfg.common_eval.path))
+    models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task(
+        [cfg.common_eval.path],
         arg_overrides=overrides,
-        suffix=getattr(args, "checkpoint_suffix", ""),
+        suffix=cfg.checkpoint.checkpoint_suffix,
     )
     model = models[0]
 
     # Move models to GPU
     for model in models:
+        model.eval()
         if use_fp16:
             model.half()
         if use_cuda:
             model.cuda()
 
     # Print args
-    logger.info(model_args)
+    logger.info(saved_cfg)
 
     # Build criterion
-    criterion = task.build_criterion(model_args)
+    criterion = task.build_criterion(saved_cfg.criterion)
     criterion.eval()
 
-
     ## knnbox related code start >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    knn_type = args.arch.split("@")[0]
+    knn_type = cfg.model.arch.split("@")[0]
     if "datastore" not in global_vars():
         # create suitable datastore class if not exists
+        print(cfg)
         if knn_type in ["vanilla_knn_mt", "adaptive_knn_mt", "kernel_smoothed_knn_mt", "vanilla_knn_mt_visual", "robust_knn_mt"]:
-            global_vars()["datastore"] = Datastore(path=args.knn_datastore_path)
+            global_vars()["datastore"] = Datastore(path=cfg.model.knn_datastore_path)
         if knn_type == "greedy_merge_knn_mt":
-            global_vars()["datastore"] = GreedyMergeDatastore(path=args.knn_datastore_path)
+            global_vars()["datastore"] = GreedyMergeDatastore(path=cfg.model.knn_datastore_path)
         if knn_type == "pck_knn_mt":
             global_vars()["datastore"] = PckDatastore(
-                path=args.knn_datastore_path,
-                reduction_network_input_dim=args.decoder_embed_dim,
-                reduction_network_output_dim=args.knn_reduct_dim,
+                path=cfg.model.knn_datastore_path,
+                reduction_network_input_dim=cfg.model.decoder_embed_dim,
+                reduction_network_output_dim=cfg.model.knn_reduct_dim,
                 dictionary_len=len(task.tgt_dict),
                 )
+        else:
+            raise ValueError(f"Unsupported knn_type for datastore initialization: {knn_type}")
     datastore = global_vars()["datastore"]
     ## <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< end
 
-    for subset in args.valid_subset.split(","):
+    for subset in cfg.dataset.valid_subset.split(","):
         try:
-            task.load_dataset(subset, combine=False, epoch=1)
+            task.load_dataset(subset, combine=False, epoch=1, task_cfg=saved_cfg.task)
             dataset = task.dataset(subset)
         except KeyError:
             raise Exception("Cannot find dataset: " + subset)
@@ -105,26 +120,26 @@ def main(args, override_args=None):
         # Initialize data iterator
         itr = task.get_batch_iterator(
             dataset=dataset,
-            max_tokens=args.max_tokens,
-            max_sentences=args.batch_size,
+            max_tokens=cfg.dataset.max_tokens,
+            max_sentences=cfg.dataset.batch_size,
             max_positions=utils.resolve_max_positions(
                 task.max_positions(),
                 *[m.max_positions() for m in models],
             ),
-            ignore_invalid_inputs=args.skip_invalid_size_inputs_valid_test,
-            required_batch_size_multiple=args.required_batch_size_multiple,
-            seed=args.seed,
-            num_shards=args.distributed_world_size,
-            shard_id=args.distributed_rank,
-            num_workers=args.num_workers,
-            data_buffer_size=args.data_buffer_size,
+            ignore_invalid_inputs=cfg.dataset.skip_invalid_size_inputs_valid_test,
+            required_batch_size_multiple=cfg.dataset.required_batch_size_multiple,
+            seed=cfg.common.seed,
+            num_shards=data_parallel_world_size,
+            shard_id=data_parallel_rank,
+            num_workers=cfg.dataset.num_workers,
+            data_buffer_size=cfg.dataset.data_buffer_size,
         ).next_epoch_itr(shuffle=False)
         progress = progress_bar.progress_bar(
             itr,
-            log_format=args.log_format,
-            log_interval=args.log_interval,
+            log_format=cfg.common.log_format,
+            log_interval=cfg.common.log_interval,
             prefix=f"valid on '{subset}' subset",
-            default_log_format=("tqdm" if not args.no_progress_bar else "simple"),
+            default_log_format=("tqdm" if not cfg.common.no_progress_bar else "simple"),
         )
 
         log_outputs = []
@@ -167,10 +182,11 @@ def main(args, override_args=None):
             progress.log(log_output, step=i)
             log_outputs.append(log_output)
 
-        if args.distributed_world_size > 1:
+        if data_parallel_world_size > 1:
             log_outputs = distributed_utils.all_gather_list(
                 log_outputs,
-                max_size=getattr(args, "all_gather_list_size", 16384),
+                max_size=cfg.common.all_gather_list_size,
+                group=distributed_utils.get_data_parallel_group(),
             )
             log_outputs = list(chain.from_iterable(log_outputs))
 
@@ -180,7 +196,6 @@ def main(args, override_args=None):
 
         progress.print(log_output, tag=subset, step=i)
 
-
     ## knnbox related code start >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     # release memory to make sure we have enough gpu memory to build faiss index
     del model, task, progress, criterion, dataset
@@ -189,14 +204,14 @@ def main(args, override_args=None):
 
     if knn_type in ["vanilla_knn_mt", "adaptive_knn_mt", "kernel_smoothed_knn_mt", "vanilla_knn_mt_visual", "plac_knn_mt", "robust_knn_mt"]:
         datastore.dump()    # dump to disk
-        datastore.build_faiss_index("keys", use_gpu=(not args.build_faiss_index_with_cpu))   # build faiss index
+        datastore.build_faiss_index("keys", use_gpu=(not cfg.model.build_faiss_index_with_cpu))   # build faiss index
     elif knn_type == "greedy_merge_knn_mt":
         datastore.dump() # dump the un-pruned datastore to disk
-        datastore.build_faiss_index("keys", do_pca=args.do_pca, pca_dim=args.pca_dim, use_gpu=(not args.build_faiss_index_with_cpu)) # build faiss index with pre-PCA operation for pruned datastore
-        if args.do_merge:
-            datastore.prune(merge_neighbors=args.merge_neighbors_n) # prune the datastore. search n neighbors when do greedy merge
+        datastore.build_faiss_index("keys", do_pca=cfg.model.do_pca, pca_dim=cfg.model.pca_dim, use_gpu=(not cfg.model.build_faiss_index_with_cpu)) # build faiss index with pre-PCA operation for pruned datastore
+        if cfg.model.do_merge:
+            datastore.prune(merge_neighbors=cfg.model.merge_neighbors_n) # prune the datastore. search n neighbors when do greedy merge
             datastore.dump() # dump the pruned datastore to disk
-            datastore.build_faiss_index("keys", do_pca=args.do_pca, pca_dim=args.pca_dim, use_gpu=(not args.build_faiss_index_with_cpu)) # build faiss index for un-pruned datastore
+            datastore.build_faiss_index("keys", do_pca=cfg.model.do_pca, pca_dim=cfg.model.pca_dim, use_gpu=(not cfg.model.build_faiss_index_with_cpu)) # build faiss index for un-pruned datastore
 
     elif knn_type == "pck_knn_mt":
         datastore.dump() # dump the un-pruned datastore to disk
@@ -227,6 +242,7 @@ def get_build_datastore_parser(default_task=None):
     group = parser.add_argument_group("Evaluation")
     from fairseq.dataclass.configs import CommonEvalConfig
     options.gen_parser_from_dataclass(group, CommonEvalConfig())
+
     return parser
 ## <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< end
 
@@ -243,12 +259,10 @@ def cli_main():
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< end
     override_args = options.parse_args_and_arch(override_parser, suppress_defaults=True)
 
-    distributed_utils.call_main(args, main, override_args=override_args)
-
-
+    distributed_utils.call_main(
+        convert_namespace_to_omegaconf(args), main, override_args=override_args
+    )
 
 
 if __name__ == "__main__":
     cli_main()
-
-
